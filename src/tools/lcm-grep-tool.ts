@@ -8,6 +8,20 @@ import { formatTimestamp } from "../compaction.js";
 
 const MAX_RESULT_CHARS = 40_000; // ~10k tokens
 
+function formatDisplayTime(
+  value: Date | string | number | null | undefined,
+  timezone: string,
+): string {
+  if (value == null) {
+    return "-";
+  }
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "-";
+  }
+  return formatTimestamp(date, timezone);
+}
+
 const LcmGrepSchema = Type.Object({
   pattern: Type.String({
     description:
@@ -141,8 +155,8 @@ export function createLcmGrepTool(input: {
       }
       if (since || before) {
         lines.push(
-          `**Time filter:** ${since ? `since ${formatTimestamp(since, timezone)}` : "since -∞"} | ${
-            before ? `before ${formatTimestamp(before, timezone)}` : "before +∞"
+          `**Time filter:** ${since ? `since ${formatDisplayTime(since, timezone)}` : "since -∞"} | ${
+            before ? `before ${formatDisplayTime(before, timezone)}` : "before +∞"
           }`,
         );
       }
@@ -156,7 +170,7 @@ export function createLcmGrepTool(input: {
         lines.push("");
         for (const msg of result.messages) {
           const snippet = truncateSnippet(msg.snippet);
-          const line = `- [msg#${msg.messageId}] (${msg.role}, ${formatTimestamp(msg.createdAt, timezone)}): ${snippet}`;
+          const line = `- [msg#${msg.messageId}] (${msg.role}, ${formatDisplayTime(msg.createdAt, timezone)}): ${snippet}`;
           if (currentChars + line.length > MAX_RESULT_CHARS) {
             lines.push("*(truncated — more results available)*");
             break;
@@ -172,7 +186,7 @@ export function createLcmGrepTool(input: {
         lines.push("");
         for (const sum of result.summaries) {
           const snippet = truncateSnippet(sum.snippet);
-          const line = `- [${sum.summaryId}] (${sum.kind}, ${formatTimestamp(sum.createdAt, timezone)}): ${snippet}`;
+          const line = `- [${sum.summaryId}] (${sum.kind}, ${formatDisplayTime(sum.createdAt, timezone)}): ${snippet}`;
           if (currentChars + line.length > MAX_RESULT_CHARS) {
             lines.push("*(truncated — more results available)*");
             break;

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import type {
   ContextEngine,
   ContextEngineInfo,
@@ -17,12 +18,13 @@ import type {
 import { blockFromPart, ContextAssembler } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import type { LcmConfig } from "./db/config.js";
-import { getLcmConnection, closeLcmConnection } from "./db/connection.js";
 import { getLcmDbFeatures } from "./db/features.js";
 import { runLcmMigrations } from "./db/migration.js";
 import {
   createDelegatedExpansionGrant,
+  getRuntimeExpansionAuthManager,
   removeDelegatedExpansionGrantForSession,
+  resolveDelegatedExpansionGrantId,
   revokeDelegatedExpansionGrantForSession,
 } from "./expansion-auth.js";
 import {
@@ -90,6 +92,116 @@ function appendTextValue(value: unknown, out: string[]): void {
   const record = value as Record<string, unknown>;
   appendTextValue(record.text, out);
   appendTextValue(record.value, out);
+}
+
+const STRUCTURED_TEXT_FIELD_KEYS = ["text", "transcript", "transcription", "message", "summary"];
+const STRUCTURED_ARRAY_FIELD_KEYS = [
+  "segments",
+  "utterances",
+  "paragraphs",
+  "alternatives",
+  "words",
+  "items",
+  "results",
+];
+const STRUCTURED_NESTED_FIELD_KEYS = ["content", "output", "result", "payload", "data", "value"];
+const MAX_STRUCTURED_TEXT_DEPTH = 6;
+const TOOL_RAW_TYPES: ReadonlySet<string> = new Set([
+  "tool_use",
+  "toolUse",
+  "tool-use",
+  "toolCall",
+  "tool_call",
+  "functionCall",
+  "function_call",
+  "function_call_output",
+  "tool_result",
+  "toolResult",
+  "tool_use_result",
+]);
+
+function looksLikeJsonPayload(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return false;
+  }
+  return (
+    (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+    (trimmed.startsWith("[") && trimmed.endsWith("]"))
+  );
+}
+
+function extractStructuredText(value: unknown, depth: number = 0): string | undefined {
+  if (value == null || depth > MAX_STRUCTURED_TEXT_DEPTH) {
+    return undefined;
+  }
+  if (typeof value === "string") {
+    if (looksLikeJsonPayload(value)) {
+      try {
+        const parsed = JSON.parse(value.trim());
+        const parsedText = extractStructuredText(parsed, depth + 1);
+        if (typeof parsedText === "string" && parsedText.length > 0) {
+          return parsedText;
+        }
+      } catch {
+        // Fall through to returning the original string when parsing fails.
+      }
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const texts: string[] = [];
+    for (const entry of value) {
+      const text = extractStructuredText(entry, depth + 1);
+      if (typeof text === "string" && text.trim().length > 0) {
+        texts.push(text);
+      }
+    }
+    return texts.length > 0 ? texts.join("\n") : undefined;
+  }
+  if (typeof value !== "object") {
+    return undefined;
+  }
+
+  const record = value as Record<string, unknown>;
+
+  // Skip tool call/result objects — their structured data belongs in the parts table, not content
+  if (typeof record.type === "string" && TOOL_RAW_TYPES.has(record.type)) {
+    return undefined;
+  }
+
+  for (const key of STRUCTURED_TEXT_FIELD_KEYS) {
+    const candidate = record[key];
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return candidate;
+    }
+  }
+
+  for (const key of STRUCTURED_ARRAY_FIELD_KEYS) {
+    const candidate = record[key];
+    if (Array.isArray(candidate)) {
+      const texts: string[] = [];
+      for (const entry of candidate) {
+        const text = extractStructuredText(entry, depth + 1);
+        if (typeof text === "string" && text.trim().length > 0) {
+          texts.push(text);
+        }
+      }
+      if (texts.length > 0) {
+        return texts.join("\n");
+      }
+    }
+  }
+
+  for (const key of STRUCTURED_NESTED_FIELD_KEYS) {
+    const nested = record[key];
+    const nestedText = extractStructuredText(nested, depth + 1);
+    if (typeof nestedText === "string" && nestedText.trim().length > 0) {
+      return nestedText;
+    }
+  }
+
+  return undefined;
 }
 
 function extractReasoningText(record: Record<string, unknown>): string | undefined {
@@ -182,18 +294,24 @@ function toPartType(type: string): MessagePartType {
  * JSON syntax that can later pollute assembled model context.
  */
 function extractMessageContent(content: unknown): string {
-  if (typeof content === "string") {
-    return content;
+  const extracted = extractStructuredText(content);
+  if (typeof extracted === "string") {
+    return extracted;
   }
-
-  if (Array.isArray(content)) {
-    return content
-      .filter((block): block is { type?: unknown; text?: unknown } => {
-        return !!block && typeof block === "object";
-      })
-      .filter((block) => block.type === "text" && typeof block.text === "string")
-      .map((block) => block.text as string)
-      .join("\n");
+  if (content == null) {
+    return "";
+  }
+  if (Array.isArray(content) && content.length === 0) {
+    return "";
+  }
+  // If content is an array of only tool call/result objects, store as empty
+  // (structured data is preserved in the message parts table)
+  if (Array.isArray(content) && content.length > 0 && content.every(
+    (item) => typeof item === "object" && item !== null && !Array.isArray(item) &&
+      typeof (item as Record<string, unknown>).type === "string" &&
+      TOOL_RAW_TYPES.has((item as Record<string, unknown>).type as string)
+  )) {
+    return "";
   }
 
   const serialized = JSON.stringify(content);
@@ -658,6 +776,7 @@ export class LcmContextEngine implements ContextEngine {
   private assembler: ContextAssembler;
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
+  private readonly db: DatabaseSync;
   private migrated = false;
   private readonly fts5Available: boolean;
   private readonly ignoreSessionPatterns: RegExp[];
@@ -667,17 +786,17 @@ export class LcmContextEngine implements ContextEngine {
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
   private deps: LcmDependencies;
 
-  constructor(deps: LcmDependencies) {
+  constructor(deps: LcmDependencies, database: DatabaseSync) {
     this.deps = deps;
     this.config = deps.config;
     this.ignoreSessionPatterns = compileSessionPatterns(this.config.ignoreSessionPatterns);
     this.statelessSessionPatterns = compileSessionPatterns(this.config.statelessSessionPatterns);
+    this.db = database;
 
-    const db = getLcmConnection(this.config.databasePath);
-    this.fts5Available = getLcmDbFeatures(db).fts5Available;
+    this.fts5Available = getLcmDbFeatures(this.db).fts5Available;
 
-    this.conversationStore = new ConversationStore(db, { fts5Available: this.fts5Available });
-    this.summaryStore = new SummaryStore(db, { fts5Available: this.fts5Available });
+    this.conversationStore = new ConversationStore(this.db, { fts5Available: this.fts5Available });
+    this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
 
     if (!this.fts5Available) {
       this.deps.log.warn(
@@ -764,8 +883,7 @@ export class LcmContextEngine implements ContextEngine {
     if (this.migrated) {
       return;
     }
-    const db = getLcmConnection(this.config.databasePath);
-    runLcmMigrations(db, { fts5Available: this.fts5Available });
+    runLcmMigrations(this.db, { fts5Available: this.fts5Available });
     this.migrated = true;
   }
 
@@ -834,6 +952,11 @@ export class LcmContextEngine implements ContextEngine {
       return undefined;
     }
     try {
+      const bySessionKey = await this.conversationStore.getConversationBySessionKey(trimmedKey);
+      if (bySessionKey) {
+        return bySessionKey.conversationId;
+      }
+
       const runtimeSessionId = await this.deps.resolveSessionIdFromSessionKey(trimmedKey);
       if (!runtimeSessionId) {
         return undefined;
@@ -1017,6 +1140,7 @@ export class LcmContextEngine implements ContextEngine {
    */
   private async reconcileSessionTail(params: {
     sessionId: string;
+    sessionKey?: string;
     conversationId: number;
     historicalMessages: AgentMessage[];
   }): Promise<{
@@ -1112,7 +1236,7 @@ export class LcmContextEngine implements ContextEngine {
     const missingTail = historicalMessages.slice(anchorIndex + 1);
     let importedMessages = 0;
     for (const message of missingTail) {
-      const result = await this.ingestSingle({ sessionId, message });
+      const result = await this.ingestSingle({ sessionId, sessionKey: params.sessionKey, message });
       if (result.ingested) {
         importedMessages += 1;
       }
@@ -1144,7 +1268,9 @@ export class LcmContextEngine implements ContextEngine {
 
     const result = await this.withSessionQueue(params.sessionId, async () =>
       this.conversationStore.withTransaction(async () => {
-        const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId);
+        const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
+          sessionKey: params.sessionKey,
+        });
         const conversationId = conversation.conversationId;
         const historicalMessages = readLeafPathMessages(params.sessionFile);
 
@@ -1200,6 +1326,7 @@ export class LcmContextEngine implements ContextEngine {
         // messages that were never persisted to LCM.
         const reconcile = await this.reconcileSessionTail({
           sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
           conversationId,
           historicalMessages,
         });
@@ -1262,17 +1389,20 @@ export class LcmContextEngine implements ContextEngine {
 
   private async ingestSingle(params: {
     sessionId: string;
+    sessionKey?: string;
     message: AgentMessage;
     isHeartbeat?: boolean;
   }): Promise<IngestResult> {
-    const { sessionId, message, isHeartbeat } = params;
+    const { sessionId, sessionKey, message, isHeartbeat } = params;
     if (isHeartbeat) {
       return { ingested: false };
     }
     const stored = toStoredMessage(message);
 
     // Get or create conversation for this session
-    const conversation = await this.conversationStore.getOrCreateConversation(sessionId);
+    const conversation = await this.conversationStore.getOrCreateConversation(sessionId, {
+      sessionKey,
+    });
     const conversationId = conversation.conversationId;
 
     let messageForParts = message;
@@ -1357,6 +1487,7 @@ export class LcmContextEngine implements ContextEngine {
       for (const message of params.messages) {
         const result = await this.ingestSingle({
           sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
           message,
           isHeartbeat: params.isHeartbeat,
         });
@@ -1407,6 +1538,7 @@ export class LcmContextEngine implements ContextEngine {
     try {
       await this.ingestBatch({
         sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
         messages: ingestBatch,
         isHeartbeat: params.isHeartbeat === true,
       });
@@ -1858,11 +1990,34 @@ export class LcmContextEngine implements ContextEngine {
         ? Math.floor(params.ttlMs)
         : undefined;
 
+    // Inherit scope from parent grant if one exists (prevents privilege escalation)
+    const parentGrantId = resolveDelegatedExpansionGrantId(parentSessionKey);
+    const parentGrant = parentGrantId
+      ? getRuntimeExpansionAuthManager().getGrant(parentGrantId)
+      : null;
+
+    const childTokenCap = parentGrant
+      ? Math.min(
+          getRuntimeExpansionAuthManager().getRemainingTokenBudget(parentGrantId!) ?? this.config.maxExpandTokens,
+          this.config.maxExpandTokens,
+        )
+      : this.config.maxExpandTokens;
+
+    const childMaxDepth = parentGrant
+      ? Math.max(0, parentGrant.maxDepth - 1)
+      : undefined;
+
+    const childAllowedSummaryIds = parentGrant?.allowedSummaryIds.length
+      ? parentGrant.allowedSummaryIds
+      : undefined;
+
     createDelegatedExpansionGrant({
       delegatedSessionKey: childSessionKey,
       issuerSessionId: parentSessionKey,
       allowedConversationIds: [conversationId],
-      tokenCap: this.config.maxExpandTokens,
+      allowedSummaryIds: childAllowedSummaryIds,
+      tokenCap: childTokenCap,
+      maxDepth: childMaxDepth,
       ttlMs,
     });
 
@@ -1907,7 +2062,7 @@ export class LcmContextEngine implements ContextEngine {
     // OpenClaw's runner calls dispose() after every run, but the plugin
     // registers a single engine instance reused by the factory. Closing
     // the DB here would break subsequent runs with "database is not open".
-    // The connection is cleaned up on process exit via closeLcmConnection().
+    // The shared connection is managed for the lifetime of the plugin process.
   }
 
   // ── Public accessors for retrieval (used by subagent expansion) ─────────
@@ -1959,18 +2114,30 @@ export class LcmContextEngine implements ContextEngine {
         continue;
       }
 
-      // Found a HEARTBEAT_OK reply. Walk backward to find the turn start
+      // Found an exact HEARTBEAT_OK reply. Walk backward to find the turn start
       // (the preceding user message).
-      const turnMessageIds: number[] = [msg.messageId];
+      const turnMessages = [msg];
       for (let j = i - 1; j >= 0; j--) {
         const prev = allMessages[j];
-        turnMessageIds.push(prev.messageId);
+        turnMessages.push(prev);
         if (prev.role === "user") {
           break; // Found turn start
         }
       }
 
-      toDelete.push(...turnMessageIds);
+      if (!turnMessages.some((record) => record.role === "user")) {
+        continue;
+      }
+      if (turnMessages.some((record) => record.role === "tool")) {
+        continue;
+      }
+
+      const messageIds = turnMessages.map((record) => record.messageId);
+      const hasToolParts = await this.turnHasToolInteractions(messageIds);
+      if (hasToolParts) {
+        continue;
+      }
+      toDelete.push(...messageIds);
     }
 
     if (toDelete.length === 0) {
@@ -1981,6 +2148,40 @@ export class LcmContextEngine implements ContextEngine {
     const uniqueIds = [...new Set(toDelete)];
     return this.conversationStore.deleteMessages(uniqueIds);
   }
+
+  private async turnHasToolInteractions(messageIds: number[]): Promise<boolean> {
+    for (const messageId of messageIds) {
+      const parts = await this.conversationStore.getMessageParts(messageId);
+      if (parts.some(messagePartIndicatesToolUsage)) {
+        return true;
+      }
+    }
+    return false;
+  }
+}
+
+// ── Tool-part detection ──────────────────────────────────────────────────────
+
+const TOOL_PART_TYPES: ReadonlySet<string> = new Set(["tool"]);
+
+function messagePartIndicatesToolUsage(part: MessagePartRecord): boolean {
+  if (TOOL_PART_TYPES.has(part.partType)) {
+    return true;
+  }
+  if (part.toolCallId || part.toolName || part.toolInput || part.toolOutput) {
+    return true;
+  }
+  if (typeof part.metadata === "string" && part.metadata.length > 0) {
+    try {
+      const meta = JSON.parse(part.metadata) as Record<string, unknown>;
+      if (typeof meta.rawType === "string" && TOOL_RAW_TYPES.has(meta.rawType)) {
+        return true;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return false;
 }
 
 // ── Heartbeat detection ─────────────────────────────────────────────────────
@@ -1990,40 +2191,11 @@ const HEARTBEAT_OK_TOKEN = "heartbeat_ok";
 /**
  * Detect whether an assistant message is a heartbeat ack.
  *
- * Matches the same pattern as OpenClaw core's heartbeat-events-filter:
- * content starts with "heartbeat_ok" (case-insensitive) and any character
- * immediately after is not alphanumeric or underscore.
- *
- * This catches:
- *   - "HEARTBEAT_OK"
- *   - "  HEARTBEAT_OK  "
- *   - "HEARTBEAT_OK — weekend, no market."
- *   - "Saturday 10:48 AM PT — weekend, no market. HEARTBEAT_OK"
- *
- * But not:
- *   - "HEARTBEAT_OK_EXTENDED" (alphanumeric continuation)
+ * Only exact (case-insensitive) "HEARTBEAT_OK" acknowledgements are pruned.
+ * Any additional text indicates the heartbeat carried real content and should remain.
  */
 function isHeartbeatOkContent(content: string): boolean {
-  const trimmed = content.trim().toLowerCase();
-  if (!trimmed) {
-    return false;
-  }
-
-  // Check if it starts with the token
-  if (trimmed.startsWith(HEARTBEAT_OK_TOKEN)) {
-    const suffix = trimmed.slice(HEARTBEAT_OK_TOKEN.length);
-    if (suffix.length === 0) {
-      return true;
-    }
-    return !/[a-z0-9_]/.test(suffix[0]);
-  }
-
-  // Also check if it ends with the token (chatty prefix + HEARTBEAT_OK)
-  if (trimmed.endsWith(HEARTBEAT_OK_TOKEN)) {
-    return true;
-  }
-
-  return false;
+  return content.trim().toLowerCase() === HEARTBEAT_OK_TOKEN;
 }
 
 // ── Emergency fallback summarization ────────────────────────────────────────
