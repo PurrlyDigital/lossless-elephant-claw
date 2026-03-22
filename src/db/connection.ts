@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 type ConnectionKey = string;
+const SQLITE_BUSY_TIMEOUT_MS = 5_000;
 
 const connectionsByPath = new Map<ConnectionKey, Set<DatabaseSync>>();
 const connectionIndex = new Map<DatabaseSync, ConnectionKey>();
@@ -29,7 +30,7 @@ function ensureDbDirectory(dbPath: string): void {
 
 function configureConnection(db: DatabaseSync): DatabaseSync {
   db.exec("PRAGMA journal_mode = WAL");
-  db.exec("PRAGMA busy_timeout = 5000");
+  db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
   db.exec("PRAGMA foreign_keys = ON");
   return db;
 }

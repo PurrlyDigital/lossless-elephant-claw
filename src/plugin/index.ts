@@ -100,6 +100,17 @@ type RuntimeModelAuth = {
 const MODEL_AUTH_PR_URL = "https://github.com/openclaw/openclaw/pull/41090";
 const MODEL_AUTH_MERGE_COMMIT = "4790e40";
 const MODEL_AUTH_REQUIRED_RELEASE = "the first OpenClaw release after 2026.3.8";
+const AUTH_ERROR_TEXT_PATTERN =
+  /\b401\b|unauthorized|unauthorised|invalid[_ -]?token|invalid[_ -]?api[_ -]?key|authentication failed|authorization failed|missing scope|insufficient scope|model\.request\b/i;
+const AUTH_ERROR_STATUS_KEYS = ["status", "statusCode", "status_code"] as const;
+const AUTH_ERROR_NESTED_KEYS = ["error", "response", "cause", "details", "data", "body"] as const;
+
+type CompletionBridgeErrorInfo = {
+  kind: "provider_auth";
+  statusCode?: number;
+  code?: string;
+  message?: string;
+};
 
 /** Capture plugin env values once during initialization. */
 function snapshotPluginEnv(env: NodeJS.ProcessEnv = process.env): PluginEnvSnapshot {
@@ -112,6 +123,93 @@ function snapshotPluginEnv(env: NodeJS.ProcessEnv = process.env): PluginEnvSnaps
     openclawDefaultModel: "",
     agentDir: env.OPENCLAW_AGENT_DIR?.trim() || env.PI_CODING_AGENT_DIR?.trim() || "",
     home: env.HOME?.trim() ?? "",
+  };
+}
+
+function truncateErrorMessage(message: string, maxChars = 240): string {
+  return message.length <= maxChars ? message : `${message.slice(0, maxChars)}...`;
+}
+
+function collectErrorText(value: unknown, out: string[], depth = 0): void {
+  if (depth >= 4) {
+    return;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed) {
+      out.push(trimmed);
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value.slice(0, 8)) {
+      collectErrorText(entry, out, depth + 1);
+    }
+    return;
+  }
+  if (!isRecord(value)) {
+    return;
+  }
+
+  for (const entry of Object.values(value).slice(0, 12)) {
+    collectErrorText(entry, out, depth + 1);
+  }
+}
+
+function extractErrorStatusCode(value: unknown, depth = 0): number | undefined {
+  if (depth >= 4 || !isRecord(value)) {
+    return undefined;
+  }
+
+  for (const key of AUTH_ERROR_STATUS_KEYS) {
+    const candidate = value[key];
+    if (typeof candidate === "number" && Number.isFinite(candidate)) {
+      return Math.trunc(candidate);
+    }
+    if (typeof candidate === "string") {
+      const parsed = Number.parseInt(candidate, 10);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+  }
+
+  for (const key of AUTH_ERROR_NESTED_KEYS) {
+    const nested = value[key];
+    const statusCode = extractErrorStatusCode(nested, depth + 1);
+    if (statusCode !== undefined) {
+      return statusCode;
+    }
+  }
+
+  return undefined;
+}
+
+function detectProviderAuthError(error: unknown): CompletionBridgeErrorInfo | undefined {
+  const statusCode = extractErrorStatusCode(error);
+  const textParts: string[] = [];
+  collectErrorText(error, textParts);
+  const normalizedMessage = textParts.join(" ").replace(/\s+/g, " ").trim();
+
+  if (statusCode !== 401 && !AUTH_ERROR_TEXT_PATTERN.test(normalizedMessage)) {
+    return undefined;
+  }
+
+  const directCode =
+    isRecord(error) && typeof error.code === "string" && error.code.trim()
+      ? error.code.trim()
+      : isRecord(error) &&
+          isRecord(error.error) &&
+          typeof error.error.code === "string" &&
+          error.error.code.trim()
+        ? error.error.code.trim()
+        : undefined;
+
+  return {
+    kind: "provider_auth",
+    ...(statusCode !== undefined ? { statusCode } : {}),
+    ...(directCode ? { code: directCode } : {}),
+    ...(normalizedMessage ? { message: truncateErrorMessage(normalizedMessage) } : {}),
   };
 }
 
@@ -740,6 +838,53 @@ async function resolveApiKeyFromAuthProfiles(params: {
     const expires = credential.expires;
     const isExpired =
       typeof expires === "number" && Number.isFinite(expires) && expires > 0 && Date.now() >= expires;
+    const shouldPreferOAuthHelper =
+      typeof params.piAiModule.getOAuthApiKey === "function" &&
+      normalizeProviderId(params.provider) === "openai-codex";
+
+    if (shouldPreferOAuthHelper) {
+      try {
+        const oauthCredential = {
+          access: credential.access ?? "",
+          refresh: credential.refresh ?? "",
+          expires: typeof credential.expires === "number" ? credential.expires : 0,
+          ...(typeof credential.projectId === "string" ? { projectId: credential.projectId } : {}),
+          ...(typeof credential.accountId === "string" ? { accountId: credential.accountId } : {}),
+        };
+        const refreshed = await params.piAiModule.getOAuthApiKey(params.provider, {
+          [params.provider]: oauthCredential,
+        });
+        if (refreshed?.apiKey) {
+          mergedStore.profiles[profileId] = {
+            ...credential,
+            ...refreshed.newCredentials,
+            type: "oauth",
+          };
+          if (persistPath) {
+            try {
+              writeFileSync(
+                persistPath,
+                JSON.stringify(
+                  {
+                    version: 1,
+                    profiles: mergedStore.profiles,
+                    ...(mergedStore.order ? { order: mergedStore.order } : {}),
+                  },
+                  null,
+                  2,
+                ),
+                "utf8",
+              );
+            } catch {
+              // Ignore persistence errors: refreshed credentials remain usable in-memory for this run.
+            }
+          }
+          return refreshed.apiKey;
+        }
+      } catch {
+        // Fall back to the cached access token below when helper resolution fails.
+      }
+    }
 
     if (!isExpired && access) {
       if (
@@ -1019,6 +1164,26 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
         if (!resolvedApiKey && modelAuth) {
           try {
             resolvedApiKey = resolveApiKeyFromAuthResult(
+              await modelAuth.getApiKeyForModel({
+                model: buildModelAuthLookupModel({
+                  provider: providerId,
+                  model: modelId,
+                  api: resolvedModel.api,
+                }),
+                cfg: api.config,
+                ...(authProfileId ? { profileId: authProfileId } : {}),
+              }),
+            );
+          } catch (err) {
+            console.error(
+              `[lcm] modelAuth.getApiKeyForModel FAILED:`,
+              err instanceof Error ? err.message : err,
+            );
+          }
+        }
+        if (!resolvedApiKey && modelAuth) {
+          try {
+            resolvedApiKey = resolveApiKeyFromAuthResult(
               await modelAuth.resolveApiKeyForProvider({
                 provider: providerId,
                 cfg: api.config,
@@ -1032,13 +1197,13 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
             );
           }
         }
-        if (!resolvedApiKey && !modelAuth) {
+        if (!resolvedApiKey) {
           resolvedApiKey = resolveApiKey(providerId, readEnv);
         }
-        if (!resolvedApiKey && !modelAuth && typeof mod.getEnvApiKey === "function") {
+        if (!resolvedApiKey && typeof mod.getEnvApiKey === "function") {
           resolvedApiKey = mod.getEnvApiKey(providerId)?.trim();
         }
-        if (!resolvedApiKey && !modelAuth) {
+        if (!resolvedApiKey) {
           resolvedApiKey = await resolveApiKeyFromAuthProfiles({
             provider: providerId,
             authProfileId,
@@ -1072,6 +1237,19 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           temperature,
           reasoning,
         });
+        const requestMetadata = {
+          request_provider: providerId,
+          request_model: modelId,
+          request_api: resolvedModel.api,
+          request_reasoning:
+            typeof reasoning === "string" && reasoning.trim() ? reasoning.trim() : "(none)",
+          request_has_system: typeof system === "string" && system.trim().length > 0 ? "true" : "false",
+          request_temperature:
+            typeof completeOptions.temperature === "number"
+              ? String(completeOptions.temperature)
+              : "(omitted)",
+          request_temperature_sent: typeof completeOptions.temperature === "number" ? "true" : "false",
+        };
 
         const result = await mod.completeSimple(
           resolvedModel,
@@ -1091,40 +1269,22 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
         if (!isRecord(result)) {
           return {
             content: [],
-            request_provider: providerId,
-            request_model: modelId,
-            request_api: resolvedModel.api,
-            request_reasoning:
-              typeof reasoning === "string" && reasoning.trim() ? reasoning.trim() : "(none)",
-            request_has_system:
-              typeof system === "string" && system.trim().length > 0 ? "true" : "false",
-            request_temperature:
-              typeof completeOptions.temperature === "number"
-                ? String(completeOptions.temperature)
-                : "(omitted)",
-            request_temperature_sent:
-              typeof completeOptions.temperature === "number" ? "true" : "false",
+            ...requestMetadata,
           };
         }
 
         return {
           ...result,
           content: Array.isArray(result.content) ? result.content : [],
-          request_provider: providerId,
-          request_model: modelId,
-          request_api: resolvedModel.api,
-          request_reasoning:
-            typeof reasoning === "string" && reasoning.trim() ? reasoning.trim() : "(none)",
-          request_has_system: typeof system === "string" && system.trim().length > 0 ? "true" : "false",
-          request_temperature:
-            typeof completeOptions.temperature === "number"
-              ? String(completeOptions.temperature)
-              : "(omitted)",
-          request_temperature_sent: typeof completeOptions.temperature === "number" ? "true" : "false",
+          ...requestMetadata,
         };
       } catch (err) {
         console.error(`[lcm] completeSimple error:`, err instanceof Error ? err.message : err);
-        return { content: [] };
+        const authError = detectProviderAuthError(err);
+        return {
+          content: [],
+          ...(authError ? { error: authError } : {}),
+        };
       }
     },
     callGateway: async (params) => {

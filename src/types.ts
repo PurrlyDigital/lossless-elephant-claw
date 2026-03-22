@@ -17,8 +17,17 @@ export type CompletionContentBlock = {
   [key: string]: unknown;
 };
 
+export type CompletionErrorInfo = {
+  kind?: string;
+  message?: string;
+  code?: string;
+  statusCode?: number;
+  [key: string]: unknown;
+};
+
 export type CompletionResult = {
   content: CompletionContentBlock[];
+  error?: CompletionErrorInfo;
   [key: string]: unknown;
 };
 

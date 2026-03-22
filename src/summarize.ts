@@ -31,6 +31,16 @@ const DIAGNOSTIC_MAX_OBJECT_KEYS = 16;
 const DIAGNOSTIC_MAX_CHARS = 1200;
 const DIAGNOSTIC_SENSITIVE_KEY_PATTERN =
   /(api[-_]?key|authorization|token|secret|password|cookie|set-cookie|private[-_]?key|bearer)/i;
+const AUTH_ERROR_TEXT_PATTERN =
+  /\b401\b|unauthorized|unauthorised|invalid[_ -]?token|invalid[_ -]?api[_ -]?key|authentication failed|authorization failed|missing scope|insufficient scope|model\.request\b/i;
+const AUTH_ERROR_STATUS_KEYS = ["status", "statusCode", "status_code"] as const;
+const AUTH_ERROR_NESTED_KEYS = ["error", "response", "cause", "details", "data", "body"] as const;
+
+type ProviderAuthFailure = {
+  statusCode?: number;
+  message?: string;
+  missingModelRequestScope: boolean;
+};
 
 /**
  * Default timeout for a single summarizer LLM call.  Long enough for large
@@ -295,6 +305,133 @@ function formatDiagnosticPayload(value: unknown): string {
   } catch {
     return "\"[unserializable]\"";
   }
+}
+
+function collectAuthFailureText(value: unknown, out: string[], depth = 0): void {
+  if (depth >= 4) {
+    return;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed) {
+      out.push(trimmed);
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value.slice(0, DIAGNOSTIC_MAX_ARRAY_ITEMS)) {
+      collectAuthFailureText(entry, out, depth + 1);
+    }
+    return;
+  }
+  if (!isRecord(value)) {
+    return;
+  }
+
+  for (const entry of Object.values(value).slice(0, DIAGNOSTIC_MAX_OBJECT_KEYS)) {
+    collectAuthFailureText(entry, out, depth + 1);
+  }
+}
+
+function extractAuthFailureStatusCode(value: unknown, depth = 0): number | undefined {
+  if (depth >= 4 || !isRecord(value)) {
+    return undefined;
+  }
+
+  for (const key of AUTH_ERROR_STATUS_KEYS) {
+    const candidate = value[key];
+    if (typeof candidate === "number" && Number.isFinite(candidate)) {
+      return Math.trunc(candidate);
+    }
+    if (typeof candidate === "string") {
+      const parsed = Number.parseInt(candidate, 10);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+  }
+
+  for (const key of AUTH_ERROR_NESTED_KEYS) {
+    const nested = value[key];
+    const statusCode = extractAuthFailureStatusCode(nested, depth + 1);
+    if (statusCode !== undefined) {
+      return statusCode;
+    }
+  }
+
+  return undefined;
+}
+
+function pickAuthInspectionValue(value: unknown): unknown {
+  if (!isRecord(value)) {
+    return value;
+  }
+  if (isRecord(value.error) && value.error.kind === "provider_auth") {
+    return value.error;
+  }
+
+  const subset: Record<string, unknown> = {};
+  for (const key of [
+    "error",
+    "errorMessage",
+    "message",
+    "status",
+    "statusCode",
+    "status_code",
+    "code",
+    "details",
+    "response",
+    "cause",
+  ]) {
+    if (key in value) {
+      subset[key] = value[key];
+    }
+  }
+  return Object.keys(subset).length > 0 ? subset : value;
+}
+
+function extractProviderAuthFailure(value: unknown): ProviderAuthFailure | undefined {
+  const inspectValue = pickAuthInspectionValue(value);
+  const statusCode = extractAuthFailureStatusCode(inspectValue);
+  const textParts: string[] = [];
+  collectAuthFailureText(inspectValue, textParts);
+  const normalizedMessage = textParts.join(" ").replace(/\s+/g, " ").trim();
+  const missingModelRequestScope = /\bmodel\.request\b/i.test(normalizedMessage);
+  const hasScopeSignal =
+    missingModelRequestScope || /\b(missing|insufficient)\s+scope\b/i.test(normalizedMessage);
+
+  if (statusCode !== 401 && !hasScopeSignal && !AUTH_ERROR_TEXT_PATTERN.test(normalizedMessage)) {
+    return undefined;
+  }
+
+  return {
+    ...(statusCode !== undefined ? { statusCode } : {}),
+    ...(normalizedMessage ? { message: truncateDiagnosticText(normalizedMessage, 240) } : {}),
+    missingModelRequestScope,
+  };
+}
+
+function buildProviderAuthWarning(params: {
+  provider: string;
+  model: string;
+  failure: ProviderAuthFailure;
+}): string {
+  const detailParts: string[] = [];
+  if (params.failure.statusCode === 401) {
+    detailParts.push("401");
+  }
+  if (params.failure.missingModelRequestScope) {
+    detailParts.push("missing model.request scope");
+  }
+  const detail =
+    detailParts.length > 0
+      ? `provider auth error (${detailParts.join(" / ")})`
+      : "provider auth error";
+  const messageSuffix =
+    params.failure.message && !params.failure.missingModelRequestScope
+      ? ` Detail: ${params.failure.message}`
+      : "";
+  return `[lcm] compaction failed: ${detail}. Check that the configured summaryProvider has valid API credentials. Current: ${params.provider}/${params.model}${messageSuffix}`;
 }
 
 /**
@@ -839,6 +976,11 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         temperature: aggressive ? 0.1 : 0.2,
       }), SUMMARIZER_TIMEOUT_MS, "initial");
     } catch (err) {
+      const authFailure = extractProviderAuthFailure(err);
+      if (authFailure) {
+        console.warn(buildProviderAuthWarning({ provider, model, failure: authFailure }));
+        return "";
+      }
       const errMsg = err instanceof Error ? err.message : String(err);
       const isTimeout = errMsg.includes("summarizer timeout");
       console.warn(
@@ -850,6 +992,12 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         );
         return buildDeterministicFallbackSummary(text, targetTokens);
       }
+      return "";
+    }
+
+    const authFailure = extractProviderAuthFailure(result);
+    if (authFailure) {
+      console.warn(buildProviderAuthWarning({ provider, model, failure: authFailure }));
       return "";
     }
 
@@ -911,6 +1059,11 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           temperature: 0.05,
           reasoning: "low",
         }), SUMMARIZER_TIMEOUT_MS, "retry");
+        const retryAuthFailure = extractProviderAuthFailure(retryResult);
+        if (retryAuthFailure) {
+          console.warn(buildProviderAuthWarning({ provider, model, failure: retryAuthFailure }));
+          return "";
+        }
 
         const retryNormalized = normalizeCompletionSummary(retryResult.content);
         summary = retryNormalized.summary;
@@ -936,6 +1089,11 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           console.error(`${retryParts.join("; ")}; falling back to truncation`);
         }
       } catch (retryErr) {
+        const retryAuthFailure = extractProviderAuthFailure(retryErr);
+        if (retryAuthFailure) {
+          console.warn(buildProviderAuthWarning({ provider, model, failure: retryAuthFailure }));
+          return "";
+        }
         // Retry is best-effort; log and proceed to deterministic fallback.
         const retryErrMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
         const isRetryTimeout = retryErrMsg.includes("summarizer timeout");

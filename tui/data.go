@@ -720,6 +720,9 @@ func openLCMDB(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite db %q: %w", path, err)
 	}
+	// WAL mode + generous busy_timeout for concurrent access with gateway.
+	db.Exec("PRAGMA journal_mode=WAL")
+	db.Exec("PRAGMA busy_timeout=10000")
 	return db, nil
 }
 

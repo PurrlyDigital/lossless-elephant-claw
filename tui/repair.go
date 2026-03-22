@@ -35,7 +35,7 @@ const (
 var (
 	lookupCLIPath       = exec.LookPath
 	execCLICommand      = exec.CommandContext
-	cliOutputTokenSlack = 64
+	cliOutputTokenSlack = 128
 )
 
 type repairOptions struct {

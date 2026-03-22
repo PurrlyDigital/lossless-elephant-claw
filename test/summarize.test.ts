@@ -561,6 +561,92 @@ describe("createLcmSummarizeFromLegacyParams", () => {
   // --- Empty-summary hardening: focused tests ---
 
   describe("empty-summary retry and diagnostics", () => {
+    it("skips retry and fallback when the provider returns an auth error envelope", async () => {
+      const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({
+            provider: "openai-codex",
+            model: "gpt-5.4",
+          })),
+          complete: vi.fn(async () => ({
+            content: [],
+            error: {
+              kind: "provider_auth",
+              statusCode: 401,
+              message: "Missing required scope: model.request",
+            },
+          })),
+        });
+
+        const result = await createLcmSummarizeFromLegacyParams({
+          deps,
+          legacyParams: { provider: "openai-codex", model: "gpt-5.4" },
+        });
+
+        const summary = await result!.fn("A".repeat(8_000), false);
+
+        expect(summary).toBe("");
+        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+
+        const warningText = consoleWarn.mock.calls.flatMap((call) => call.map(String)).join(" ");
+        expect(warningText).toContain("provider auth error (401 / missing model.request scope)");
+        expect(warningText).toContain("Check that the configured summaryProvider has valid API credentials.");
+        expect(warningText).toContain("Current: openai-codex/gpt-5.4");
+
+        const errorText = consoleError.mock.calls.flatMap((call) => call.map(String)).join(" ");
+        expect(errorText).not.toContain("retrying with conservative settings");
+        expect(errorText).not.toContain("falling back to truncation");
+      } finally {
+        consoleWarn.mockRestore();
+        consoleError.mockRestore();
+      }
+    });
+
+    it("skips retry and fallback when the completion call throws an auth error", async () => {
+      const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({
+            provider: "openai-codex",
+            model: "gpt-5.4",
+          })),
+          complete: vi.fn(async () => {
+            throw {
+              statusCode: 401,
+              error: {
+                code: "insufficient_scope",
+                message: "Missing required scope: model.request",
+              },
+            };
+          }),
+        });
+
+        const result = await createLcmSummarizeFromLegacyParams({
+          deps,
+          legacyParams: { provider: "openai-codex", model: "gpt-5.4" },
+        });
+
+        const summary = await result!.fn("B".repeat(8_000), false);
+
+        expect(summary).toBe("");
+        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+
+        const warningText = consoleWarn.mock.calls.flatMap((call) => call.map(String)).join(" ");
+        expect(warningText).toContain("provider auth error (401 / missing model.request scope)");
+        expect(warningText).toContain("Current: openai-codex/gpt-5.4");
+
+        const errorText = consoleError.mock.calls.flatMap((call) => call.map(String)).join(" ");
+        expect(errorText).not.toContain("summarizer call failed");
+        expect(errorText).not.toContain("retrying with conservative settings");
+      } finally {
+        consoleWarn.mockRestore();
+        consoleError.mockRestore();
+      }
+    });
+
     it("retries with conservative settings when first attempt returns empty content array", async () => {
       const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
       try {

@@ -247,6 +247,19 @@ describe("LcmContextEngine metadata", () => {
     const engine = createEngine();
     expect(engine.info.ownsCompaction).toBe(true);
   });
+
+  it("configures file-backed sqlite connections with WAL and busy_timeout", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-db-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "pragmas.db");
+    const db = createLcmDatabaseConnection(dbPath);
+
+    const journal = db.prepare("PRAGMA journal_mode").get() as { journal_mode?: string };
+    const busy = db.prepare("PRAGMA busy_timeout").get() as { timeout?: number };
+
+    expect(journal.journal_mode).toBe("wal");
+    expect(busy.timeout).toBe(5000);
+  });
 });
 
 describe("LcmContextEngine ignored sessions", () => {
