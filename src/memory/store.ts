@@ -111,13 +111,54 @@ function estimateTokens(content: string): number {
   return Math.ceil(content.length / 4);
 }
 
+const QUERY_STOPWORDS = new Set([
+  'a',
+  'an',
+  'and',
+  'are',
+  'as',
+  'at',
+  'be',
+  'by',
+  'for',
+  'from',
+  'how',
+  'i',
+  'in',
+  'is',
+  'it',
+  'long',
+  'me',
+  'my',
+  'of',
+  'on',
+  'or',
+  'our',
+  'that',
+  'the',
+  'this',
+  'to',
+  'was',
+  'were',
+  'what',
+  'when',
+  'where',
+  'who',
+  'why',
+  'with',
+]);
+
 function normalizeQueryTerms(query: string): string[] {
-  return query
+  const terms = query
     .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
     .split(/\s+/)
     .map((term) => term.trim())
     .filter((term) => term.length >= 2)
-    .slice(0, 8);
+    .filter((term) => !QUERY_STOPWORDS.has(term));
+
+  const deduped = [...new Set(terms)];
+  return deduped.slice(0, 8);
 }
 
 function computeScore(input: {
@@ -406,11 +447,13 @@ export class LtmMemoryStore {
 
       if (rows.length === 0) {
         const likeWhere = [...where];
+        const likeClauses: string[] = [];
         const likeArgs = [...args];
         for (const term of queryTerms) {
-          likeWhere.push('LOWER(m.content) LIKE ?');
+          likeClauses.push('LOWER(m.content) LIKE ?');
           likeArgs.push(`%${term}%`);
         }
+        likeWhere.push(`(${likeClauses.join(' OR ')})`);
 
         rows = this.db.prepare(
           `SELECT

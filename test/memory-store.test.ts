@@ -86,4 +86,37 @@ describe('LtmMemoryStore', () => {
 
     expect(recalled).toHaveLength(0);
   });
+
+  it('matches hyphenated natural-language queries in fallback search mode', async () => {
+    const db = new DatabaseSync(':memory:');
+    runLcmMigrations(db, { fts5Available: false });
+    const created = db
+      .prepare(`INSERT INTO conversations (session_id, session_key, title) VALUES (?, ?, ?)`)
+      .run('session-3', 'agent:main:session-3', 'test');
+    const conversationId = Number(created.lastInsertRowid);
+    const store = new LtmMemoryStore(db, { fts5Available: false });
+
+    await store.upsertMemory({
+      conversationId,
+      kind: 'profile',
+      content: 'I have lived in this house since 2011.',
+      confidence: 0.92,
+      importance: 0.86,
+      decayClass: 'durable',
+      stage: 'post',
+      sourceType: 'message',
+      sourceRef: '301',
+    });
+
+    const recalled = await store.search({
+      query: 'move-in date how long lived in this house',
+      scope: 'all',
+      limit: 10,
+    });
+
+    expect(recalled.length).toBeGreaterThan(0);
+    expect(
+      recalled.some((memory) => memory.content.toLowerCase().includes('lived in this house since 2011')),
+    ).toBe(true);
+  });
 });
