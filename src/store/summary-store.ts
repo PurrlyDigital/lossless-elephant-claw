@@ -112,6 +112,11 @@ export type ConversationBootstrapStateRecord = {
   updatedAt: Date;
 };
 
+export type SummaryCursor = {
+  createdAt: string | null;
+  summaryId: string | null;
+};
+
 // ── DB row shapes (snake_case) ────────────────────────────────────────────────
 
 interface SummaryRow {
@@ -170,6 +175,11 @@ interface TokenSumRow {
 
 interface MessageIdRow {
   message_id: number;
+}
+
+interface SummaryCursorRow {
+  summary_id: string;
+  created_at: string;
 }
 
 interface LargeFileRow {
@@ -412,6 +422,77 @@ export class SummaryStore {
        ORDER BY created_at`,
       )
       .all(conversationId) as unknown as SummaryRow[];
+    return rows.map(toSummaryRecord);
+  }
+
+  async getLatestSummaryCursor(conversationId: number): Promise<SummaryCursor | null> {
+    const row = this.db
+      .prepare(
+        `SELECT summary_id, created_at
+         FROM summaries
+         WHERE conversation_id = ?
+         ORDER BY created_at DESC, summary_id DESC
+         LIMIT 1`,
+      )
+      .get(conversationId) as SummaryCursorRow | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      createdAt: row.created_at,
+      summaryId: row.summary_id,
+    };
+  }
+
+  async getSummariesAfterCursor(input: {
+    conversationId: number;
+    cursor?: SummaryCursor | null;
+    limit?: number;
+  }): Promise<SummaryRecord[]> {
+    const limit =
+      typeof input.limit === "number" && Number.isFinite(input.limit) && input.limit > 0
+        ? Math.min(500, Math.floor(input.limit))
+        : 200;
+    const cursorCreatedAt = input.cursor?.createdAt ?? null;
+    const cursorSummaryId = input.cursor?.summaryId ?? null;
+
+    let rows: SummaryRow[] = [];
+    if (cursorCreatedAt && cursorSummaryId) {
+      rows = this.db
+        .prepare(
+          `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
+                  earliest_at, latest_at, descendant_count, created_at,
+                  descendant_token_count, source_message_token_count, model
+           FROM summaries
+           WHERE conversation_id = ?
+             AND (
+               julianday(created_at) > julianday(?)
+               OR (created_at = ? AND summary_id > ?)
+             )
+           ORDER BY created_at ASC, summary_id ASC
+           LIMIT ?`,
+        )
+        .all(
+          input.conversationId,
+          cursorCreatedAt,
+          cursorCreatedAt,
+          cursorSummaryId,
+          limit,
+        ) as SummaryRow[];
+    } else {
+      rows = this.db
+        .prepare(
+          `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
+                  earliest_at, latest_at, descendant_count, created_at,
+                  descendant_token_count, source_message_token_count, model
+           FROM summaries
+           WHERE conversation_id = ?
+           ORDER BY created_at ASC, summary_id ASC
+           LIMIT ?`,
+        )
+        .all(input.conversationId, limit) as SummaryRow[];
+    }
+
     return rows.map(toSummaryRecord);
   }
 

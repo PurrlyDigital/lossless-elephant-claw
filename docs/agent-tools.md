@@ -1,6 +1,6 @@
 # Agent tools
 
-LCM provides four tools for agents to search, inspect, and recall information from compacted conversation history.
+LCM provides seven tools for compacted-history recall and durable long-term memory.
 
 ## Usage patterns
 
@@ -13,6 +13,14 @@ Most recall tasks follow this escalation:
 3. **`lcm_expand_query`** — Deep recall: spawn a sub-agent to expand the DAG and answer a focused question
 
 Start with grep. If the snippet is enough, stop. If you need full summary content, use describe. If you need details that were compressed away, use expand_query.
+
+### Durable-memory pattern
+
+Use long-term memory tools when durable facts are relevant across sessions:
+
+1. **`lcm_memory_recall`** — Retrieve durable memories by query/scope
+2. **`lcm_memory_store`** — Explicitly persist a fact/preference/decision
+3. **`lcm_memory_forget`** — Suppress an incorrect or stale memory
 
 ### When to expand
 
@@ -156,6 +164,49 @@ lcm_expand_query(
 Low-level DAG expansion tool. **Only available to sub-agents** spawned by `lcm_expand_query`. Main agents should always use `lcm_expand_query` instead.
 
 This tool is what the expansion sub-agent uses internally to walk the summary DAG, read source messages, and build its answer.
+
+### lcm_memory_recall
+
+Retrieve durable long-term memories captured from pre/during/post compaction extraction.
+
+**Parameters:**
+
+| Param | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `query` | string | | — | Optional search query |
+| `limit` | number | | 10 | Max results (1–50) |
+| `scope` | string | | `"session"` | `"session"`, `"global"`, or `"all"` |
+| `conversationId` | number | | current | Conversation override |
+| `allConversations` | boolean | | `false` | Cross-conversation scope helper |
+
+### lcm_memory_store
+
+Persist an explicit durable memory item.
+
+**Parameters:**
+
+| Param | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `text` | string | ✅ | — | Memory content |
+| `kind` | string | | `"fact"` | Memory class |
+| `confidence` | number | | 0.92 | Confidence override (0–1) |
+| `importance` | number | | 0.85 | Importance override (0–1) |
+| `ttlHours` | number | | — | Optional expiration |
+| `scope` | string | | `"session"` | `"session"` or `"global"` |
+
+### lcm_memory_forget
+
+Suppress memory entries by ID or query.
+
+**Parameters:**
+
+| Param | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `memoryId` | string | ✅* | — | Specific memory ID |
+| `query` | string | ✅* | — | Query-based suppression |
+| `reason` | string | | — | Optional tombstone reason |
+
+*One of `memoryId` or `query` is required.
 
 ## Tips for agent developers
 

@@ -554,6 +554,49 @@ export function runLcmMigrations(
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS ltm_memories (
+      memory_id TEXT PRIMARY KEY,
+      conversation_id INTEGER REFERENCES conversations(conversation_id) ON DELETE SET NULL,
+      kind TEXT NOT NULL,
+      content TEXT NOT NULL,
+      normalized_content TEXT NOT NULL,
+      confidence REAL NOT NULL DEFAULT 0.5,
+      importance REAL NOT NULL DEFAULT 0.5,
+      decay_class TEXT NOT NULL DEFAULT 'durable',
+      source_stage TEXT NOT NULL DEFAULT 'post',
+      metadata TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+      expires_at TEXT,
+      suppressed INTEGER NOT NULL DEFAULT 0 CHECK (suppressed IN (0, 1))
+    );
+
+    CREATE TABLE IF NOT EXISTS ltm_memory_sources (
+      memory_source_id TEXT PRIMARY KEY,
+      memory_id TEXT NOT NULL REFERENCES ltm_memories(memory_id) ON DELETE CASCADE,
+      source_type TEXT NOT NULL CHECK (source_type IN ('message', 'summary', 'manual', 'backfill')),
+      source_ref TEXT,
+      conversation_id INTEGER REFERENCES conversations(conversation_id) ON DELETE SET NULL,
+      stage TEXT NOT NULL DEFAULT 'post',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (memory_id, source_type, source_ref)
+    );
+
+    CREATE TABLE IF NOT EXISTS ltm_memory_tombstones (
+      tombstone_id TEXT PRIMARY KEY,
+      memory_id TEXT REFERENCES ltm_memories(memory_id) ON DELETE SET NULL,
+      query TEXT,
+      reason TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS ltm_backfill_state (
+      worker_key TEXT PRIMARY KEY,
+      cursor_created_at TEXT,
+      cursor_summary_id TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     -- Indexes
     CREATE INDEX IF NOT EXISTS messages_conv_seq_idx ON messages (conversation_id, seq);
     CREATE INDEX IF NOT EXISTS summaries_conv_created_idx ON summaries (conversation_id, created_at);
@@ -563,6 +606,16 @@ export function runLcmMigrations(
     CREATE INDEX IF NOT EXISTS large_files_conv_idx ON large_files (conversation_id, created_at);
     CREATE INDEX IF NOT EXISTS bootstrap_state_path_idx
       ON conversation_bootstrap_state (session_file_path, updated_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS ltm_memories_kind_normalized_idx
+      ON ltm_memories (kind, normalized_content);
+    CREATE INDEX IF NOT EXISTS ltm_memories_conv_seen_idx
+      ON ltm_memories (conversation_id, last_seen_at);
+    CREATE INDEX IF NOT EXISTS ltm_memories_active_idx
+      ON ltm_memories (suppressed, expires_at);
+    CREATE INDEX IF NOT EXISTS ltm_sources_memory_idx
+      ON ltm_memory_sources (memory_id, created_at);
+    CREATE INDEX IF NOT EXISTS ltm_tombstones_memory_idx
+      ON ltm_memory_tombstones (memory_id, created_at);
   `);
 
   // Forward-compatible conversations migration for existing DBs.
@@ -647,6 +700,32 @@ export function runLcmMigrations(
       );
       INSERT INTO summaries_fts(summary_id, content)
       SELECT summary_id, content FROM summaries;
+    `);
+  }
+
+  const memoriesFtsInfo = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='ltm_memories_fts'")
+    .get() as { sql?: string } | undefined;
+  const memoriesFtsSql = memoriesFtsInfo?.sql ?? "";
+  const memoriesFtsColumns = db.prepare(`PRAGMA table_info(ltm_memories_fts)`).all() as Array<{
+    name?: string;
+  }>;
+  const hasMemoryIdColumn = memoriesFtsColumns.some((col) => col.name === "memory_id");
+  const shouldRecreateMemoriesFts =
+    !memoriesFtsInfo ||
+    !hasMemoryIdColumn ||
+    memoriesFtsSql.includes("content_rowid='memory_id'") ||
+    memoriesFtsSql.includes('content_rowid="memory_id"');
+  if (shouldRecreateMemoriesFts) {
+    db.exec(`
+      DROP TABLE IF EXISTS ltm_memories_fts;
+      CREATE VIRTUAL TABLE ltm_memories_fts USING fts5(
+        memory_id UNINDEXED,
+        content,
+        tokenize='porter unicode61'
+      );
+      INSERT INTO ltm_memories_fts(memory_id, content)
+      SELECT memory_id, content FROM ltm_memories WHERE suppressed = 0;
     `);
   }
 }

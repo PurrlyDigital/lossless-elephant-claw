@@ -44,6 +44,10 @@
     "expansionProvider": {
       "label": "Expansion Provider",
       "help": "Provider override for lcm_expand_query sub-agent (e.g., 'anthropic')"
+    },
+    "memory": {
+      "label": "Long-Term Memory",
+      "help": "Controls long-term memory extraction, recall injection, and backfill."
     }
   },
   "configSchema": {
@@ -111,6 +115,43 @@
       },
       "expansionProvider": {
         "type": "string"
+      },
+      "memory": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "autoRecall": {
+            "type": "boolean"
+          },
+          "recallBudgetTokens": {
+            "type": "integer",
+            "minimum": 120
+          },
+          "topK": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "captureStages": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "pre",
+                "during",
+                "post"
+              ]
+            }
+          },
+          "backfillEnabled": {
+            "type": "boolean"
+          },
+          "vectorEnabled": {
+            "type": "boolean"
+          }
+        }
       }
     }
   }

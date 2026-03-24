@@ -15,6 +15,9 @@ import { createLcmDescribeTool } from "../tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "../tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
+import { createLcmMemoryForgetTool } from "../tools/lcm-memory-forget-tool.js";
+import { createLcmMemoryRecallTool } from "../tools/lcm-memory-recall-tool.js";
+import { createLcmMemoryStoreTool } from "../tools/lcm-memory-store-tool.js";
 import type { LcmDependencies } from "../types.js";
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
@@ -1466,7 +1469,7 @@ const lcmPlugin = {
   id: "lossless-claw",
   name: "Lossless Context Management",
   description:
-    "DAG-based conversation summarization with incremental compaction, full-text search, and sub-agent expansion",
+    "DAG-based conversation summarization with incremental compaction, long-term memory, full-text search, and sub-agent expansion",
 
   configSchema: {
     parse(value: unknown) {
@@ -1512,6 +1515,25 @@ const lcmPlugin = {
         lcm,
         sessionKey: ctx.sessionKey,
         requesterSessionKey: ctx.sessionKey,
+      }),
+    );
+    api.registerTool((ctx) =>
+      createLcmMemoryRecallTool({
+        deps,
+        lcm,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+    api.registerTool((ctx) =>
+      createLcmMemoryStoreTool({
+        deps,
+        lcm,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+    api.registerTool((_ctx) =>
+      createLcmMemoryForgetTool({
+        lcm,
       }),
     );
 

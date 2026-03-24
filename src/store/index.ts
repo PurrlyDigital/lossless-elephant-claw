@@ -28,4 +28,5 @@ export type {
   LargeFileRecord,
   UpsertConversationBootstrapStateInput,
   ConversationBootstrapStateRecord,
+  SummaryCursor,
 } from "./summary-store.js";

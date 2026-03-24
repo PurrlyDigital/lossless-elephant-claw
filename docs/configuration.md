@@ -172,6 +172,46 @@ Plugin config example:
 }
 ```
 
+## Long-term memory
+
+`lossless-claw` can persist durable memories in the same SQLite database (`ltm_*` tables) and inject top matches into `systemPromptAddition` during assembly.
+
+Environment variables:
+
+```bash
+export LCM_MEMORY_ENABLED=true
+export LCM_MEMORY_AUTO_RECALL=true
+export LCM_MEMORY_RECALL_BUDGET_TOKENS=1000
+export LCM_MEMORY_TOP_K=8
+export LCM_MEMORY_CAPTURE_STAGES=pre,during,post
+export LCM_MEMORY_BACKFILL_ENABLED=true
+export LCM_MEMORY_VECTOR_ENABLED=false
+```
+
+Plugin config example:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "lossless-claw": {
+        "config": {
+          "memory": {
+            "enabled": true,
+            "autoRecall": true,
+            "recallBudgetTokens": 1000,
+            "topK": 8,
+            "captureStages": ["pre", "during", "post"],
+            "backfillEnabled": true,
+            "vectorEnabled": false
+          }
+        }
+      }
+    }
+  }
+}
+```
+
 ## TUI conversation window size
 
 `LCM_TUI_CONVERSATION_WINDOW_SIZE` (default `200`) controls how many messages `lcm-tui` loads per keyset-paged conversation window when a session has an LCM `conversation_id`.

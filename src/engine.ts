@@ -41,12 +41,15 @@ import { logStartupBannerOnce } from "./startup-banner-log.js";
 import {
   ConversationStore,
   type CreateMessagePartInput,
+  type MessageRecord,
   type MessagePartRecord,
   type MessagePartType,
 } from "./store/conversation-store.js";
-import { SummaryStore } from "./store/summary-store.js";
+import { SummaryStore, type SummaryCursor } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams } from "./summarize.js";
 import type { LcmDependencies } from "./types.js";
+import { LtmMemoryManager } from "./memory/manager.js";
+import { LtmMemoryStore } from "./memory/store.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 type AssembleResultWithSystemPrompt = AssembleResult & { systemPromptAddition?: string };
@@ -959,6 +962,8 @@ export class LcmContextEngine implements ContextEngine {
 
   private conversationStore: ConversationStore;
   private summaryStore: SummaryStore;
+  private memoryStore: LtmMemoryStore;
+  private memory: LtmMemoryManager;
   private assembler: ContextAssembler;
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
@@ -1025,6 +1030,8 @@ export class LcmContextEngine implements ContextEngine {
       fts5Available: this.fts5Available,
     });
     this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
+    this.memoryStore = new LtmMemoryStore(this.db, { fts5Available: this.fts5Available });
+    this.memory = new LtmMemoryManager(this.memoryStore, this.config);
 
     if (!this.fts5Available) {
       this.deps.log.warn(
@@ -1117,6 +1124,56 @@ export class LcmContextEngine implements ContextEngine {
     }
     runLcmMigrations(this.db, { fts5Available: this.fts5Available });
     this.migrated = true;
+  }
+
+  private async readRecentlyIngestedMessages(
+    conversationId: number,
+    ingestedCount: number,
+  ): Promise<MessageRecord[]> {
+    if (!Number.isFinite(ingestedCount) || ingestedCount <= 0) {
+      return [];
+    }
+    const maxSeq = await this.conversationStore.getMaxSeq(conversationId);
+    const afterSeq = Math.max(0, maxSeq - Math.floor(ingestedCount));
+    return this.conversationStore.getMessages(conversationId, { afterSeq });
+  }
+
+  private async captureDuringCompactionFromCursor(
+    conversationId: number,
+    cursorBefore: SummaryCursor | null,
+  ): Promise<void> {
+    if (!this.config.memory?.enabled) {
+      return;
+    }
+
+    const summaries = await this.summaryStore.getSummariesAfterCursor({
+      conversationId,
+      cursor: cursorBefore,
+      limit: 400,
+    });
+    if (summaries.length === 0) {
+      return;
+    }
+
+    await this.memory.captureDuringCompaction({
+      conversationId,
+      summaries,
+    });
+  }
+
+  private mergeSystemPromptAdditions(primary?: string, extra?: string): string | undefined {
+    const first = typeof primary === "string" ? primary.trim() : "";
+    const second = typeof extra === "string" ? extra.trim() : "";
+    if (!first && !second) {
+      return undefined;
+    }
+    if (!first) {
+      return second;
+    }
+    if (!second) {
+      return first;
+    }
+    return `${first}\n\n${second}`;
   }
 
   /**
@@ -2118,6 +2175,29 @@ export class LcmContextEngine implements ContextEngine {
       return;
     }
 
+    const conversation = await this.conversationStore.getConversationForSession({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+    });
+    const conversationId = conversation?.conversationId;
+    const recentlyIngested =
+      conversationId != null
+        ? await this.readRecentlyIngestedMessages(conversationId, ingestBatch.length)
+        : [];
+
+    if (conversationId != null) {
+      try {
+        await this.memory.capturePreCompaction({
+          conversationId,
+          messages: recentlyIngested,
+        });
+      } catch (err) {
+        this.deps.log.debug?.(
+          `[lcm] memory pre-capture skipped: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
     const legacyParams = asRecord(params.runtimeContext) ?? asRecord(params.legacyCompactionParams);
     const DEFAULT_AFTER_TURN_TOKEN_BUDGET = 128_000;
     const resolvedTokenBudget = this.resolveTokenBudget({
@@ -2164,6 +2244,30 @@ export class LcmContextEngine implements ContextEngine {
       });
     } catch {
       // Proactive compaction is best-effort in the post-turn lifecycle.
+    }
+
+    if (conversationId != null) {
+      try {
+        await this.memory.capturePostTurn({
+          conversationId,
+          messages: recentlyIngested,
+        });
+      } catch (err) {
+        this.deps.log.debug?.(
+          `[lcm] memory post-capture skipped: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      try {
+        await this.memory.runBackfillBatch({
+          conversationId,
+          summaryStore: this.summaryStore,
+        });
+      } catch (err) {
+        this.deps.log.debug?.(
+          `[lcm] memory backfill batch skipped: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
   }
 
@@ -2234,11 +2338,28 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
 
+      let memoryPromptAddition: string | undefined;
+      try {
+        memoryPromptAddition = await this.memory.buildAutoRecallBlock({
+          conversationId: conversation.conversationId,
+          liveMessages: params.messages,
+        });
+      } catch (err) {
+        this.deps.log.debug?.(
+          `[lcm] memory recall injection skipped: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
       const result: AssembleResultWithSystemPrompt = {
         messages: assembled.messages,
         estimatedTokens: assembled.estimatedTokens,
-        ...(assembled.systemPromptAddition
-          ? { systemPromptAddition: assembled.systemPromptAddition }
+        ...(this.mergeSystemPromptAdditions(assembled.systemPromptAddition, memoryPromptAddition)
+          ? {
+            systemPromptAddition: this.mergeSystemPromptAdditions(
+              assembled.systemPromptAddition,
+              memoryPromptAddition,
+            ),
+          }
           : {}),
       };
       return result;
@@ -2314,6 +2435,9 @@ export class LcmContextEngine implements ContextEngine {
             reason: "no conversation found for session",
           };
         }
+        const summaryCursorBefore = await this.summaryStore.getLatestSummaryCursor(
+          conversation.conversationId,
+        );
 
         const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
         const tokenBudget = this.resolveTokenBudget({
@@ -2351,6 +2475,10 @@ export class LcmContextEngine implements ContextEngine {
           previousSummaryContent: params.previousSummaryContent,
           summaryModel,
         });
+        await this.captureDuringCompactionFromCursor(
+          conversation.conversationId,
+          summaryCursorBefore,
+        );
         const tokensBefore = observedTokens ?? leafResult.tokensBefore;
 
         return {
@@ -2420,6 +2548,7 @@ export class LcmContextEngine implements ContextEngine {
         }
 
         const conversationId = conversation.conversationId;
+        const summaryCursorBefore = await this.summaryStore.getLatestSummaryCursor(conversationId);
 
       const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
       const lp = legacyParams ?? {};
@@ -2488,6 +2617,7 @@ export class LcmContextEngine implements ContextEngine {
           hardTrigger: false,
           summaryModel,
         });
+        await this.captureDuringCompactionFromCursor(conversationId, summaryCursorBefore);
 
         return {
           ok: sweepResult.actionTaken || !liveContextStillExceedsTarget,
@@ -2525,6 +2655,7 @@ export class LcmContextEngine implements ContextEngine {
         summarize,
         summaryModel,
       });
+      await this.captureDuringCompactionFromCursor(conversationId, summaryCursorBefore);
       const didCompact = compactResult.rounds > 0;
 
       return {
@@ -2666,6 +2797,10 @@ export class LcmContextEngine implements ContextEngine {
 
   getSummaryStore(): SummaryStore {
     return this.summaryStore;
+  }
+
+  getMemoryManager(): LtmMemoryManager {
+    return this.memory;
   }
 
   // ── Heartbeat pruning ──────────────────────────────────────────────────

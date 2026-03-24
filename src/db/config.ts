@@ -1,6 +1,18 @@
 import { homedir } from "os";
 import { join } from "path";
 
+export type LcmMemoryCaptureStage = "pre" | "during" | "post";
+
+export type LcmMemoryConfig = {
+  enabled: boolean;
+  autoRecall: boolean;
+  recallBudgetTokens: number;
+  topK: number;
+  captureStages: LcmMemoryCaptureStage[];
+  backfillEnabled: boolean;
+  vectorEnabled: boolean;
+};
+
 export type LcmConfig = {
   enabled: boolean;
   databasePath: string;
@@ -42,6 +54,7 @@ export type LcmConfig = {
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
   pruneHeartbeatOk: boolean;
+  memory: LcmMemoryConfig;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -89,6 +102,20 @@ function toStrArray(value: unknown): string[] | undefined {
     .filter(Boolean);
 }
 
+function normalizeMemoryCaptureStages(value: unknown): LcmMemoryCaptureStage[] | undefined {
+  const raw = toStrArray(value);
+  if (!raw) {
+    return undefined;
+  }
+
+  const normalized = raw
+    .map((entry) => entry.trim().toLowerCase())
+    .filter((entry): entry is LcmMemoryCaptureStage => {
+      return entry === "pre" || entry === "during" || entry === "post";
+    });
+  return normalized.length > 0 ? normalized : [];
+}
+
 /**
  * Resolve LCM configuration with three-tier precedence:
  *   1. Environment variables (highest — backward compat)
@@ -100,6 +127,19 @@ export function resolveLcmConfig(
   pluginConfig?: Record<string, unknown>,
 ): LcmConfig {
   const pc = pluginConfig ?? {};
+  const memoryConfig =
+    pc.memory && typeof pc.memory === "object" && !Array.isArray(pc.memory)
+      ? (pc.memory as Record<string, unknown>)
+      : {};
+
+  const memoryCaptureStagesFromEnv =
+    env.LCM_MEMORY_CAPTURE_STAGES !== undefined
+      ? normalizeMemoryCaptureStages(env.LCM_MEMORY_CAPTURE_STAGES)
+      : undefined;
+  const memoryCaptureStages =
+    memoryCaptureStagesFromEnv
+    ?? normalizeMemoryCaptureStages(memoryConfig.captureStages)
+    ?? ["pre", "during", "post"];
 
   return {
     enabled:
@@ -185,5 +225,34 @@ export function resolveLcmConfig(
       env.LCM_PRUNE_HEARTBEAT_OK !== undefined
         ? env.LCM_PRUNE_HEARTBEAT_OK === "true"
         : toBool(pc.pruneHeartbeatOk) ?? false,
+    memory: {
+      enabled:
+        env.LCM_MEMORY_ENABLED !== undefined
+          ? env.LCM_MEMORY_ENABLED === "true"
+          : toBool(memoryConfig.enabled) ?? true,
+      autoRecall:
+        env.LCM_MEMORY_AUTO_RECALL !== undefined
+          ? env.LCM_MEMORY_AUTO_RECALL === "true"
+          : toBool(memoryConfig.autoRecall) ?? true,
+      recallBudgetTokens:
+        (env.LCM_MEMORY_RECALL_BUDGET_TOKENS !== undefined
+          ? parseInt(env.LCM_MEMORY_RECALL_BUDGET_TOKENS, 10)
+          : undefined)
+        ?? Math.max(120, Math.floor(toNumber(memoryConfig.recallBudgetTokens) ?? 1000)),
+      topK:
+        (env.LCM_MEMORY_TOP_K !== undefined
+          ? parseInt(env.LCM_MEMORY_TOP_K, 10)
+          : undefined)
+        ?? Math.max(1, Math.floor(toNumber(memoryConfig.topK) ?? 8)),
+      captureStages: memoryCaptureStages,
+      backfillEnabled:
+        env.LCM_MEMORY_BACKFILL_ENABLED !== undefined
+          ? env.LCM_MEMORY_BACKFILL_ENABLED === "true"
+          : toBool(memoryConfig.backfillEnabled) ?? true,
+      vectorEnabled:
+        env.LCM_MEMORY_VECTOR_ENABLED !== undefined
+          ? env.LCM_MEMORY_VECTOR_ENABLED === "true"
+          : toBool(memoryConfig.vectorEnabled) ?? false,
+    },
   };
 }

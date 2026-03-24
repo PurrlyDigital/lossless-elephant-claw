@@ -21,7 +21,7 @@ When a conversation grows beyond the model's context window, OpenClaw (just like
 2. **Summarizes chunks** of older messages into summaries using your configured LLM
 3. **Condenses summaries** into higher-level nodes as they accumulate, forming a DAG (directed acyclic graph)
 4. **Assembles context** each turn by combining summaries + recent raw messages
-5. **Provides tools** (`lcm_grep`, `lcm_describe`, `lcm_expand`) so agents can search and recall details from compacted history
+5. **Provides tools** (`lcm_grep`, `lcm_describe`, `lcm_expand`, `lcm_expand_query`) plus long-term memory tools (`lcm_memory_recall`, `lcm_memory_store`, `lcm_memory_forget`)
 
 Nothing is lost. Raw messages stay in the database. Summaries link back to their source messages. Agents can drill into any summary to recover the original detail.
 
@@ -135,6 +135,13 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_SUMMARY_PROVIDER` | `""` | Provider override for compaction summarization; falls back to `OPENCLAW_PROVIDER` or the provider embedded in the model ref |
 | `LCM_EXPANSION_MODEL` | *(from OpenClaw)* | Model override for `lcm_expand_query` sub-agent (e.g. `anthropic/claude-haiku-4-5`) |
 | `LCM_EXPANSION_PROVIDER` | *(from OpenClaw)* | Provider override for `lcm_expand_query` sub-agent |
+| `LCM_MEMORY_ENABLED` | `true` | Enable/disable long-term memory extraction and retrieval |
+| `LCM_MEMORY_AUTO_RECALL` | `true` | Inject top long-term memories into assembled context |
+| `LCM_MEMORY_RECALL_BUDGET_TOKENS` | `1000` | Token budget for auto-recall block |
+| `LCM_MEMORY_TOP_K` | `8` | Max long-term memories injected/recalled per request |
+| `LCM_MEMORY_CAPTURE_STAGES` | `pre,during,post` | Capture stages enabled for durable-memory extraction |
+| `LCM_MEMORY_BACKFILL_ENABLED` | `true` | Enable incremental backfill from historical summaries |
+| `LCM_MEMORY_VECTOR_ENABLED` | `false` | Reserved flag for optional vector retrieval path |
 | `LCM_AUTOCOMPACT_DISABLED` | `false` | Disable automatic compaction after turns |
 | `LCM_PRUNE_HEARTBEAT_OK` | `false` | Retroactively delete `HEARTBEAT_OK` turn cycles from LCM storage |
 
@@ -178,6 +185,7 @@ Plugin config equivalents:
 - `skipStatelessSessions`
 - `summaryModel`
 - `summaryProvider`
+- `memory` (`enabled`, `autoRecall`, `recallBudgetTokens`, `topK`, `captureStages`, `backfillEnabled`, `vectorEnabled`)
 
 Environment variables still win over plugin config when both are set.
 
@@ -362,6 +370,10 @@ src/
   expansion-auth.ts         # Delegation grants for sub-agent expansion
   expansion-policy.ts       # Depth/token policy for expansion
   large-files.ts            # File interception, storage, and exploration summaries
+  memory/
+    extractor.ts            # Durable-memory candidate extraction rules
+    store.ts                # Long-term memory persistence and retrieval
+    manager.ts              # Capture orchestration and auto-recall injection
   integrity.ts              # DAG integrity checks and repair utilities
   transcript-repair.ts      # Tool-use/result pairing sanitization
   types.ts                  # Core type definitions (dependency injection contracts)
@@ -379,6 +391,9 @@ src/
     lcm-describe-tool.ts    # lcm_describe tool implementation
     lcm-expand-tool.ts      # lcm_expand tool (sub-agent only)
     lcm-expand-query-tool.ts # lcm_expand_query tool (main agent wrapper)
+    lcm-memory-recall-tool.ts # lcm_memory_recall tool
+    lcm-memory-store-tool.ts # lcm_memory_store tool
+    lcm-memory-forget-tool.ts # lcm_memory_forget tool
     lcm-conversation-scope.ts # Conversation scoping utilities
     common.ts               # Shared tool utilities
 test/                       # Vitest test suite
