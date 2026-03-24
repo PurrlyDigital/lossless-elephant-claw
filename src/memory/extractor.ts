@@ -33,7 +33,7 @@ const EPHEMERAL_HINTS: RegExp[] = [
 ];
 
 const DURABLE_HINTS = {
-  profile: /\b(my name is|i am|i'm|my timezone is|i live in|i work as)\b/i,
+  profile: /\b(my name is|i am|i'm|my timezone is|i live in|i work as|i have lived|i've lived|i have \d+\s+(kids?|children|cats?|dogs?|pets?)|my (kids?|children|cats?|dogs?|pets?))\b/i,
   preference: /\b(i prefer|i like|i dislike|please always|please never|always|never)\b/i,
   decision: /\b(we decided|decision:|we will|agreed to|final decision|chosen approach)\b/i,
   constraint: /\b(must|must not|cannot|can't|constraint|requirement|non-negotiable)\b/i,

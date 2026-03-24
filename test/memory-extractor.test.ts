@@ -28,4 +28,24 @@ describe('memory extractor', () => {
     const b = normalizeMemoryContent('we decided use sqlite');
     expect(a).toBe(b);
   });
+
+  it('captures durable personal profile statements like residence duration and family/pets', () => {
+    const text = [
+      'I have lived in this house since 2011.',
+      'I have 3 cats: Frank, Null, and Void.',
+      'I have 2 kids: Emmett and Ayla.',
+    ].join('\n');
+
+    const candidates = extractMemoryCandidates({
+      text,
+      stage: 'post',
+      role: 'user',
+    });
+
+    const lines = candidates.map((candidate) => candidate.content.toLowerCase());
+    expect(lines.some((line) => line.includes('lived in this house since 2011'))).toBe(true);
+    expect(lines.some((line) => line.includes('have 3 cats'))).toBe(true);
+    expect(lines.some((line) => line.includes('have 2 kids'))).toBe(true);
+    expect(candidates.every((candidate) => candidate.kind === 'profile')).toBe(true);
+  });
 });
