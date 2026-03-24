@@ -32,8 +32,8 @@ describe('memory extractor', () => {
   it('captures durable personal profile statements like residence duration and family/pets', () => {
     const text = [
       'I have lived in this house since 2011.',
-      'I have 3 cats: Frank, Null, and Void.',
-      'I have 2 kids: Emmett and Ayla.',
+      'I have 3 cats: Nova, Pixel, and Orbit.',
+      'I have 2 kids: Riley and Quinn.',
     ].join('\n');
 
     const candidates = extractMemoryCandidates({
