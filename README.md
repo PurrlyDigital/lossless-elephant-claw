@@ -1,6 +1,8 @@
-# lossless-claw
+# lossless-elephant-claw
 
-Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/openclaw), based on the [LCM paper](https://papers.voltropy.com/LCM) from [Voltropy](https://x.com/Voltropy). Replaces OpenClaw's built-in sliding-window compaction with a DAG-based summarization system that preserves every message while keeping active context within model token limits.
+Lossless Context + Memory Management plugin for [OpenClaw](https://github.com/openclaw/openclaw), based on the [LCM paper](https://papers.voltropy.com/LCM) from [Voltropy](https://x.com/Voltropy). It keeps the original DAG-based lossless context compaction model and extends it with durable long-term memory extraction, storage, and recall.
+
+This repository builds directly on the original [`@martian-engineering/lossless-claw`](https://github.com/martian-engineering/lossless-claw) work.
 
 ## Table of contents
 
