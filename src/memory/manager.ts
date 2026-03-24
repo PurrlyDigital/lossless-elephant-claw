@@ -43,6 +43,41 @@ function extractTextFromUnknown(value: unknown): string {
   return chunks.join('\n').trim();
 }
 
+function normalizeLiveQueryChunk(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return '';
+  }
+
+  // Telegram/OpenClaw wrappers can prepend large untrusted metadata blocks.
+  // Strip fenced blocks and wrapper labels so user intent remains in budget.
+  let normalized = trimmed
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/\bConversation info \(untrusted metadata\):/gi, ' ')
+    .replace(/\bSender \(untrusted metadata\):/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!normalized) {
+    return '';
+  }
+
+  // Session bootstrap command payloads are not useful for retrieval.
+  if (
+    normalized.includes('A new session was started via /new or /reset.')
+    || normalized.includes('Run your Session Startup sequence')
+  ) {
+    return '';
+  }
+
+  // Prefer the tail: real user ask often appears after routing metadata.
+  if (normalized.length > 260) {
+    normalized = normalized.slice(-260).trim();
+  }
+
+  return normalized;
+}
+
 function normalizeCaptureStages(stages: string[]): Set<MemoryStage> {
   const allowed: MemoryStage[] = ['pre', 'during', 'post'];
   const selected = new Set<MemoryStage>();
@@ -397,7 +432,7 @@ export class LtmMemoryManager {
       if (message.role !== 'user' && message.role !== 'assistant') {
         continue;
       }
-      const text = extractTextFromUnknown(message.content).trim();
+      const text = normalizeLiveQueryChunk(extractTextFromUnknown(message.content));
       if (!text) {
         continue;
       }
