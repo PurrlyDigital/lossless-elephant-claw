@@ -4,9 +4,12 @@ Lossless Context + Memory Management plugin for [OpenClaw](https://github.com/op
 
 This repository builds directly on the original [`@martian-engineering/lossless-claw`](https://github.com/martian-engineering/lossless-claw) work.
 
+Compatibility note: project/repo naming is `lossless-elephant-claw`, while the OpenClaw plugin ID and config key remain `lossless-claw` for backward compatibility.
+
 ## Table of contents
 
 - [What it does](#what-it-does)
+- [Memory lifecycle](#memory-lifecycle)
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [Documentation](#documentation)
@@ -29,6 +32,16 @@ Nothing is lost. Raw messages stay in the database. Summaries link back to their
 
 **It feels like talking to an agent that never forgets. Because it doesn't. In normal operation, you'll never need to think about compaction again.**
 
+### Memory lifecycle
+
+Long-term memory capture and recall follow this pipeline:
+
+1. **Pre-compaction capture (`pre`)** extracts durable candidates from recent user/assistant messages before compaction runs.
+2. **During-compaction capture (`during`)** extracts durable candidates from newly created summaries.
+3. **Post-turn capture (`post`)** extracts durable candidates from live turn messages after ingest.
+4. **Backfill** incrementally walks historical summaries and stores durable candidates without reprocessing everything each run.
+5. **Auto-recall** injects top matched memories into assembled context within a token budget.
+
 ## Quick start
 
 ### Prerequisites
@@ -39,7 +52,7 @@ Nothing is lost. Raw messages stay in the database. Summaries link back to their
 
 ### Install the plugin
 
-Use OpenClaw's plugin installer (recommended):
+Use OpenClaw's plugin installer for the upstream package baseline:
 
 ```bash
 openclaw plugins install @martian-engineering/lossless-claw
@@ -51,12 +64,13 @@ If you're running from a local OpenClaw checkout, use:
 pnpm openclaw plugins install @martian-engineering/lossless-claw
 ```
 
-For local plugin development, link your working copy instead of copying files:
+To install this fork (`lossless-elephant-claw`) specifically, link a local clone:
 
 ```bash
-openclaw plugins install --link /path/to/lossless-claw
+git clone git@github.com:PurrlyDigital/lossless-elephant-claw.git
+openclaw plugins install --link /path/to/lossless-elephant-claw
 # or from a local OpenClaw checkout:
-# pnpm openclaw plugins install --link /path/to/lossless-claw
+# pnpm openclaw plugins install --link /path/to/lossless-elephant-claw
 ```
 
 The install command records the plugin, enables it, and applies compatible slot selection (including `contextEngine` when applicable).
@@ -65,7 +79,7 @@ The install command records the plugin, enables it, and applies compatible slot 
 
 In most cases, no manual JSON edits are needed after `openclaw plugins install`.
 
-If you need to set it manually, ensure the context engine slot points at lossless-claw:
+If you need to set it manually, ensure the context engine slot points at `lossless-claw` (the compatibility plugin ID):
 
 ```json
 {
@@ -208,6 +222,17 @@ If `summaryModel` already includes a provider prefix such as `anthropic/claude-s
 LCM_FRESH_TAIL_COUNT=32
 LCM_INCREMENTAL_MAX_DEPTH=-1
 LCM_CONTEXT_THRESHOLD=0.75
+```
+
+Optional memory defaults for "elephant" behavior:
+
+```
+LCM_MEMORY_ENABLED=true
+LCM_MEMORY_AUTO_RECALL=true
+LCM_MEMORY_TOP_K=8
+LCM_MEMORY_RECALL_BUDGET_TOKENS=1000
+LCM_MEMORY_CAPTURE_STAGES=pre,during,post
+LCM_MEMORY_BACKFILL_ENABLED=true
 ```
 
 - **freshTailCount=32** protects the last 32 messages from compaction, giving the model enough recent context for continuity.
@@ -392,7 +417,9 @@ src/
     lcm-grep-tool.ts        # lcm_grep tool implementation
     lcm-describe-tool.ts    # lcm_describe tool implementation
     lcm-expand-tool.ts      # lcm_expand tool (sub-agent only)
+    lcm-expand-tool.delegation.ts # lcm_expand sub-agent delegation helpers
     lcm-expand-query-tool.ts # lcm_expand_query tool (main agent wrapper)
+    lcm-expansion-recursion-guard.ts # Expansion recursion guardrails
     lcm-memory-recall-tool.ts # lcm_memory_recall tool
     lcm-memory-store-tool.ts # lcm_memory_store tool
     lcm-memory-forget-tool.ts # lcm_memory_forget tool
