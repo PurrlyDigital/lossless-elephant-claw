@@ -389,7 +389,8 @@ export class LtmMemoryManager {
   }
 
   private buildLiveQuery(messages: AgentMessage[]): string {
-    const chunks: string[] = [];
+    const userChunks: string[] = [];
+    const assistantChunks: string[] = [];
 
     for (let i = messages.length - 1; i >= 0; i -= 1) {
       const message = messages[i] as { role?: unknown; content?: unknown };
@@ -400,12 +401,18 @@ export class LtmMemoryManager {
       if (!text) {
         continue;
       }
-      chunks.push(text);
-      if (chunks.length >= 3) {
+
+      if (message.role === 'user') {
+        userChunks.push(text);
+      } else {
+        assistantChunks.push(text);
+      }
+
+      if (userChunks.length >= 2 && assistantChunks.length >= 1) {
         break;
       }
     }
 
-    return chunks.reverse().join(' ').slice(0, 600);
+    return [...userChunks, ...assistantChunks].join(' ').slice(0, 600);
   }
 }
